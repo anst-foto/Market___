@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="Market.Api/Market.Api.csproj" />
+  <Project Path="Market.Core.Test/Market.Core.Test.csproj" />
+  <Project Path="Market.Core/Market.Core.csproj" />
+</Solution>
