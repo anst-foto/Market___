@@ -29,7 +29,7 @@ public record Product
 
     public static async Task SaveProductsAsync(IEnumerable<Product> products, string path = "products.json", CancellationToken cancellationToken = default)
     {
-        await using var stream = new FileStream(path, FileMode.OpenOrCreate, FileAccess.Write);
+        await using var stream = new FileStream(path, FileMode.Create, FileAccess.Write);
         await JsonSerializer.SerializeAsync(stream, products, _jsonOptions, cancellationToken);
     }
 

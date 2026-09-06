@@ -1,34 +1,32 @@
 <#
 .SYNOPSIS
-    Сборка, восстановление зависимостей и запуск тестов .NET проекта с генерацией HTML-отчёта.
+    Сборка, восстановление зависимостей и запуск всех тестов решения с генерацией HTML и TRX отчётов.
 .DESCRIPTION
-    Скрипт выполняет dotnet restore, dotnet build и dotnet test с опцией --logger:html.
-    Всегда открывает сгенерированный отчёт в проводнике.
+    Скрипт ищет файл решения с расширением .slnx в указанной папке, добавляет в него все тестовые проекты,
+    выполняет restore, build и test для всего решения.
 .PARAMETER ProjectPath
-    Путь к файлу .sln или .csproj (по умолчанию текущая директория).
+    Путь к папке с решением (по умолчанию текущая). Если передан путь к .slnx, используется он.
 .PARAMETER Configuration
     Конфигурация сборки: Debug или Release (по умолчанию Debug).
 .PARAMETER ResultsPath
-    Путь к папке, куда будет сохранён HTML-отчёт (по умолчанию ./Test/TestResults).
+    Путь к папке для отчётов (по умолчанию ./Test/TestResults).
 .PARAMETER NoRestore
-    Если указан, пропускает шаг восстановления (полезно при повторных запусках).
+    Если указан, пропускает восстановление зависимостей.
 .EXAMPLE
     .\RunTests.ps1
-    .\RunTests.ps1 -ProjectPath .\MySolution.sln -Configuration Release
+    .\RunTests.ps1 -ProjectPath .\MySolution -Configuration Release
     .\RunTests.ps1 -ResultsPath .\Reports -NoRestore
 #>
 
 param(
     [string]$ProjectPath = ".",
     [string]$Configuration = "Debug",
-    [string]$ResultsPath = ".\Market.Core.Test\TestResults",
+    [string]$ResultsPath = ".\Test\TestResults",
     [switch]$NoRestore
 )
 
-# --- Настройка кодировки консоли (для корректного отображения эмодзи) ---
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-# --- Вспомогательные функции для красивого вывода ---
 function Write-Step {
     param([string]$Message, [string]$Color = "Cyan")
     Write-Host ""
@@ -50,88 +48,148 @@ function Write-Info {
     Write-Host "ℹ️  $Message" -ForegroundColor Yellow
 }
 
-# --- Проверка наличия dotnet ---
 if (-not (Get-Command "dotnet" -ErrorAction SilentlyContinue)) {
-    Write-ErrorMsg "Команда 'dotnet' не найдена. Убедитесь, что .NET SDK установлен и доступен в PATH."
+    Write-ErrorMsg "Команда 'dotnet' не найдена. Установите .NET SDK."
     exit 1
 }
 
-# --- Создание папки для отчётов (если её нет) ---
+# Определяем файл решения — ищем только .slnx
+function Get-SolutionFile {
+    param([string]$Path)
+    if (Test-Path $Path -PathType Container) {
+        $slnFiles = Get-ChildItem -Path $Path -File | Where-Object { $_.Extension -eq '.slnx' }
+        if ($slnFiles.Count -eq 0) {
+            Write-ErrorMsg "Не найден .slnx файл в папке '$Path'."
+            exit 1
+        }
+        if ($slnFiles.Count -gt 1) {
+            Write-ErrorMsg "Найдено несколько .slnx файлов: $($slnFiles.Name -join ', '). Укажите конкретный путь."
+            exit 1
+        }
+        return $slnFiles[0].FullName
+    } elseif (Test-Path $Path -PathType Leaf) {
+        if ($Path -like "*.slnx") {
+            return (Resolve-Path $Path).Path
+        } else {
+            Write-ErrorMsg "Указанный файл не является .slnx: $Path"
+            exit 1
+        }
+    } else {
+        Write-ErrorMsg "Путь '$Path' не существует."
+        exit 1
+    }
+}
+
+$slnPath = Get-SolutionFile -Path $ProjectPath
+Write-Step "Решение: $slnPath" "Magenta"
+
+# Находим все тестовые проекты в папке решения
+$solutionFolder = Split-Path $slnPath -Parent
+$testProjects = Get-ChildItem -Path $solutionFolder -Recurse -Filter "*Test*.csproj" -ErrorAction SilentlyContinue
+if ($testProjects.Count -eq 0) {
+    Write-ErrorMsg "Тестовые проекты не найдены."
+    exit 1
+}
+Write-Info "Найдены тестовые проекты: $($testProjects.Name -join ', ')"
+
+# Проверяем, входят ли они в решение (используем относительный путь)
+$slnContent = Get-Content $slnPath -Raw
+foreach ($proj in $testProjects) {
+    # Вычисляем относительный путь к проекту относительно папки решения
+    $relPath = [System.IO.Path]::GetRelativePath($solutionFolder, $proj.FullName)
+    if ($slnContent -notmatch [regex]::Escape($relPath)) {
+        Write-Step "Добавляем проект $($proj.Name) в решение" "Yellow"
+        dotnet sln $slnPath add $proj.FullName
+        if ($LASTEXITCODE -ne 0) {
+            Write-ErrorMsg "Не удалось добавить $($proj.Name) в решение."
+            exit 1
+        }
+        Write-Success "Проект $($proj.Name) добавлен."
+    } else {
+        Write-Info "Проект $($proj.Name) уже в решении."
+    }
+}
+
+# Создаём папку для отчётов
 if (-not (Test-Path $ResultsPath)) {
-    Write-Step "Создание папки для отчётов: $ResultsPath" "Yellow"
     New-Item -ItemType Directory -Path $ResultsPath -Force | Out-Null
 }
 
-# --- Полный путь к файлу отчёта ---
-$reportFileName = "results.html"
-$reportFullPath = Join-Path -Path $ResultsPath -ChildPath $reportFileName
+$reportHtml = Join-Path -Path $ResultsPath -ChildPath "results.html"
+$reportTrx   = Join-Path -Path $ResultsPath -ChildPath "results.trx"
 
-# --- Основной процесс ---
-Write-Step "Начинаем сборку и тестирование проекта: $ProjectPath" "Magenta"
 $global:exitCode = 0
 
-# 1. Restore (если не отключено)
+# Restore
 if (-not $NoRestore) {
-    Write-Step "Шаг 1: Восстановление зависимостей (dotnet restore)" "Cyan"
-    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-    dotnet restore $ProjectPath -v q
-    $stopwatch.Stop()
-    Write-Info "Время выполнения 'dotnet restore': $($stopwatch.Elapsed.ToString('mm\:ss\.fff'))"
+    Write-Step "Восстановление зависимостей (dotnet restore)" "Cyan"
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    dotnet restore $slnPath -v q
+    $sw.Stop()
+    Write-Info "Время: $($sw.Elapsed.ToString('mm\:ss\.fff'))"
     if ($LASTEXITCODE -ne 0) {
-        Write-ErrorMsg "Ошибка восстановления зависимостей. Код: $LASTEXITCODE"
+        Write-ErrorMsg "Ошибка restore. Код: $LASTEXITCODE"
         exit $LASTEXITCODE
     }
-    Write-Success "Восстановление завершено успешно."
+    Write-Success "Восстановление завершено."
 } else {
-    Write-Info "Пропускаем восстановление зависимостей (указан параметр -NoRestore)."
+    Write-Info "Пропускаем restore (параметр -NoRestore)."
 }
 
-# 2. Build
-Write-Step "Шаг 2: Сборка проекта (dotnet build) - конфигурация $Configuration" "Cyan"
-$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-dotnet build $ProjectPath --no-restore -c $Configuration -v q
-$stopwatch.Stop()
-Write-Info "Время выполнения 'dotnet build': $($stopwatch.Elapsed.ToString('mm\:ss\.fff'))"
+# Build
+Write-Step "Сборка решения (dotnet build) - $Configuration" "Cyan"
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+dotnet build $slnPath --no-restore -c $Configuration -v q
+$sw.Stop()
+Write-Info "Время: $($sw.Elapsed.ToString('mm\:ss\.fff'))"
 if ($LASTEXITCODE -ne 0) {
     Write-ErrorMsg "Ошибка сборки. Код: $LASTEXITCODE"
     exit $LASTEXITCODE
 }
-Write-Success "Сборка завершена успешно."
+Write-Success "Сборка завершена."
 
-# 3. Test с генерацией отчёта
-Write-Step "Шаг 3: Запуск тестов с генерацией HTML-отчёта" "Cyan"
-$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-dotnet test $ProjectPath --no-build --no-restore -c $Configuration `
-    --logger:"html;LogFileName=$reportFileName" `
+# Test — запускаем все тесты решения с двумя логгерами: HTML и TRX
+Write-Step "Запуск всех тестов с генерацией HTML и TRX отчётов" "Cyan"
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+dotnet test $slnPath --no-build --no-restore -c $Configuration `
+    --logger:"html;LogFileName=results.html" `
+    --logger:"trx;LogFileName=results.trx" `
     --results-directory $ResultsPath `
     -v q
-$stopwatch.Stop()
-Write-Info "Время выполнения 'dotnet test': $($stopwatch.Elapsed.ToString('mm\:ss\.fff'))"
+$sw.Stop()
+Write-Info "Время тестирования: $($sw.Elapsed.ToString('mm\:ss\.fff'))"
 if ($LASTEXITCODE -ne 0) {
-    Write-ErrorMsg "Тесты завершились с ошибкой. Код: $LASTEXITCODE"
+    Write-ErrorMsg "Тесты завершились с ошибками. Код: $LASTEXITCODE"
     $global:exitCode = $LASTEXITCODE
 } else {
-    Write-Success "Все тесты пройдены успешно."
+    Write-Success "Все тесты пройдены."
 }
 
-# --- Открытие отчёта (всегда) ---
-if (Test-Path $reportFullPath) {
-    Write-Step "Открытие отчёта: $reportFullPath" "Yellow"
+# Открываем HTML-отчёт
+if (Test-Path $reportHtml) {
+    Write-Step "Открытие HTML-отчёта: $reportHtml" "Yellow"
     try {
-        explorer.exe $reportFullPath
-        Write-Success "Отчёт открыт в проводнике."
+        explorer.exe $reportHtml
+        Write-Success "Отчёт открыт."
     } catch {
         Write-ErrorMsg "Не удалось открыть отчёт: $_"
         $global:exitCode = 1
     }
 } else {
-    Write-ErrorMsg "Файл отчёта не найден: $reportFullPath"
+    Write-ErrorMsg "HTML-отчёт не найден: $reportHtml"
     $global:exitCode = 1
 }
 
-# --- Итоговое сообщение ---
+# Информация о TRX
+if (Test-Path $reportTrx) {
+    Write-Info "TRX-отчёт сохранён: $reportTrx"
+} else {
+    Write-ErrorMsg "TRX-отчёт не найден: $reportTrx"
+    $global:exitCode = 1
+}
+
 if ($global:exitCode -eq 0) {
-    Write-Step "✅ ВСЕ ЭТАПЫ ЗАВЕРШЕНЫ УСПЕШНО" "Green"
+    Write-Step "✅ ВСЕ ЭТАПЫ ВЫПОЛНЕНЫ УСПЕШНО" "Green"
 } else {
     Write-Step "⚠️  СКРИПТ ЗАВЕРШИЛСЯ С ОШИБКОЙ (код $global:exitCode)" "Red"
 }

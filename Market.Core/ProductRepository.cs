@@ -10,12 +10,15 @@ namespace Market.Core;
 public class ProductRepository
 {
     private List<Product> _products;
+    private bool _isLoaded;
     private readonly string _filePath;
+    private readonly SemaphoreSlim _semaphore = new SemaphoreSlim(1, 1);
 
     public ProductRepository(string filePath = "products.json")
     {
         _filePath = filePath;
-        _products = [];
+        _products = new List<Product>();
+        _isLoaded = false;
     }
 
     private async Task LoadAsync(CancellationToken cancellationToken = default)
@@ -29,15 +32,26 @@ public class ProductRepository
                 return;
             }
         }
-
-        _products = [];
+        _products = new List<Product>();
     }
 
     private async Task EnsureLoadedAsync(CancellationToken cancellationToken = default)
     {
-        if (_products == null)
+        if (_isLoaded)
+            return;
+
+        await _semaphore.WaitAsync(cancellationToken);
+        try
         {
-            await LoadAsync(cancellationToken);
+            if (!_isLoaded)
+            {
+                await LoadAsync(cancellationToken);
+                _isLoaded = true;
+            }
+        }
+        finally
+        {
+            _semaphore.Release();
         }
     }
 
@@ -55,7 +69,7 @@ public class ProductRepository
     public async Task<Product?> GetByIdAsync(Guid id, CancellationToken cancellationToken = default)
     {
         await EnsureLoadedAsync(cancellationToken);
-        return _products.SingleOrDefault(p => p.Guid == id);
+        return _products.FirstOrDefault(p => p.Guid == id);
     }
 
     public async Task<Product> AddAsync(Product product, CancellationToken cancellationToken = default)
@@ -63,14 +77,22 @@ public class ProductRepository
         if (product == null)
             throw new ArgumentNullException(nameof(product));
 
-        await EnsureLoadedAsync(cancellationToken);
+        await EnsureLoadedAsync(cancellationToken); // загрузка без блокировки на запись
 
-        if (_products.Any(p => p.Guid == product.Guid))
-            throw new InvalidOperationException($"Продукт с Guid {product.Guid} уже существует.");
+        await _semaphore.WaitAsync(cancellationToken);
+        try
+        {
+            if (_products.Any(p => p.Guid == product.Guid))
+                throw new InvalidOperationException($"Продукт с Guid {product.Guid} уже существует.");
 
-        _products.Add(product);
-        await SaveAsync(cancellationToken);
-        return product;
+            _products.Add(product);
+            await SaveAsync(cancellationToken);
+            return product;
+        }
+        finally
+        {
+            _semaphore.Release();
+        }
     }
 
     public async Task<Product?> UpdateAsync(Product product, CancellationToken cancellationToken = default)
@@ -80,27 +102,42 @@ public class ProductRepository
 
         await EnsureLoadedAsync(cancellationToken);
 
-        var existing = _products.FirstOrDefault(p => p.Guid == product.Guid);
-        if (existing == null)
-            return null;
+        await _semaphore.WaitAsync(cancellationToken);
+        try
+        {
+            var existing = _products.FirstOrDefault(p => p.Guid == product.Guid);
+            if (existing == null)
+                return null;
 
-        var index = _products.IndexOf(existing);
-        _products[index] = product with { };
-
-        await SaveAsync(cancellationToken);
-        return product;
+            var index = _products.IndexOf(existing);
+            _products[index] = product with { };
+            await SaveAsync(cancellationToken);
+            return product;
+        }
+        finally
+        {
+            _semaphore.Release();
+        }
     }
 
     public async Task<bool> DeleteAsync(Guid id, CancellationToken cancellationToken = default)
     {
         await EnsureLoadedAsync(cancellationToken);
 
-        var existing = _products.FirstOrDefault(p => p.Guid == id);
-        if (existing == null)
-            return false;
+        await _semaphore.WaitAsync(cancellationToken);
+        try
+        {
+            var existing = _products.FirstOrDefault(p => p.Guid == id);
+            if (existing == null)
+                return false;
 
-        _products.Remove(existing);
-        await SaveAsync(cancellationToken);
-        return true;
+            _products.Remove(existing);
+            await SaveAsync(cancellationToken);
+            return true;
+        }
+        finally
+        {
+            _semaphore.Release();
+        }
     }
 }

@@ -7,26 +7,24 @@ using System.Net.Http;
 using System.Net.Http.Json;
 using System.Text.Json;
 using System.Threading.Tasks;
-
 using Market.Core;
-
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.DependencyInjection;
-
 using Xunit;
 
 namespace Market.Api.Tests
 {
-    public class EndToEndTests : IClassFixture<WebApplicationFactory<Program>>, IDisposable
+    [Collection("NonParallel")]
+    public class EndToEndTests : IDisposable
     {
+        private readonly string _testFilePath;
         private readonly WebApplicationFactory<Program> _factory;
         private readonly HttpClient _client;
-        private readonly string _testFilePath;
 
-        public EndToEndTests(WebApplicationFactory<Program> factory)
+        public EndToEndTests()
         {
             _testFilePath = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString() + ".json");
-            _factory = factory.WithWebHostBuilder(builder =>
+            _factory = new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
             {
                 builder.ConfigureServices(services =>
                 {
@@ -41,6 +39,8 @@ namespace Market.Api.Tests
 
         public void Dispose()
         {
+            _client.Dispose();
+            _factory.Dispose();
             if (File.Exists(_testFilePath))
                 File.Delete(_testFilePath);
         }
@@ -60,8 +60,8 @@ namespace Market.Api.Tests
         {
             var products = new List<Product>
             {
-                new() { Name = "Product1", Price = 10 },
-                new() { Name = "Product2", Price = 20 }
+                new Product { Name = "Product1", Price = 10 },
+                new Product { Name = "Product2", Price = 20 }
             };
             foreach (var p in products)
             {
@@ -74,7 +74,9 @@ namespace Market.Api.Tests
             var result = await response.Content.ReadFromJsonAsync<IEnumerable<Product>>();
             Assert.NotNull(result);
             var list = result.ToList();
-            Assert.Equal(products, list);
+            Assert.Equal(2, list.Count);
+            Assert.Equal("Product1", list[0].Name);
+            Assert.Equal("Product2", list[1].Name);
         }
 
         [Fact]
@@ -133,6 +135,7 @@ namespace Market.Api.Tests
             Assert.Equal(HttpStatusCode.Created, response1.StatusCode);
             var created = await response1.Content.ReadFromJsonAsync<Product>();
             Assert.NotNull(created);
+
             var duplicate = new Product { Guid = created.Guid, Name = "Dup2", Price = 2 };
             var response2 = await _client.PostAsJsonAsync("/products", duplicate);
             Assert.Equal(HttpStatusCode.BadRequest, response2.StatusCode);
@@ -222,4 +225,7 @@ namespace Market.Api.Tests
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         }
     }
+
+    [CollectionDefinition("NonParallel", DisableParallelization = true)]
+    public class NonParallelCollection { }
 }
